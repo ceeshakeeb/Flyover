@@ -2126,7 +2126,7 @@ async function saveUserData(){
 }
 
 handleAuth = async function(){
- const email=document.getElementById('fEmail').value.trim();
+const email=document.getElementById('fEmail').value.trim().toLowerCase();
  const pass=document.getElementById('fPassword').value;
  const name=(document.getElementById('fName')?.value||'').trim();
  const err=document.getElementById('authErr');
@@ -2166,8 +2166,7 @@ window.addEventListener('load',()=>{
  document.body.style.overscrollBehavior='none';
  document.documentElement.style.overscrollBehavior='none';
 });
-// Register Firebase auth listener immediately to avoid race condition
-// where onAuthStateChanged fires before load event
+
 (function registerAuthListener(){
  if(!window.onAuthStateChangedFirebase || !window.auth){
    setTimeout(registerAuthListener,100);
@@ -2180,13 +2179,37 @@ window.addEventListener('load',()=>{
      return;
    }
    if(document.getElementById('mainScreen').classList.contains('active')) return;
+   
    let name=user.displayName||'User';
+   let initials='U';
+   
    try{
      const snap=await window.dbGet(window.dbRef(window.db,'users/'+user.uid));
-     if(snap.exists()){ const p=snap.val(); name=p.name||name; }
+     if(snap.exists()){ 
+       const p=snap.val(); 
+       name=p.name||name;
+       initials=p.initials||(p.name||name).split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+     } else {
+       try{
+         const userInitials=name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+         await window.dbSet(window.dbRef(window.db,'users/'+user.uid),{
+           name,
+           email:user.email,
+           initials:userInitials
+         });
+         initials=userInitials;
+       }catch(e){console.log('Error creating user node:',e);}
+     }
+     
      const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+user.uid));
      if(ds.exists()) Object.assign(S, ds.val());
-   }catch(e){}
-   loginUser({id:user.uid,name,email:user.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
+   }catch(e){console.log('Error loading user data:',e);}
+   
+   loginUser({
+     id:user.uid,
+     name,
+     email:user.email,
+     initials:initials
+   });
  });
 })();
