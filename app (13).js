@@ -2134,7 +2134,10 @@ const email=document.getElementById('fEmail').value.trim().toLowerCase();
  try{
    if(authMode==='register'){
       const cred=await window.createUserWithEmailAndPassword(window.auth,email,pass);
-      await window.dbSet(window.dbRef(window.db,'users/'+cred.user.uid),{name,email});
+const userInitials=name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+await window.dbSet(window.dbRef(window.db,'users/'+cred.user.uid),{name,email,initials:userInitials});
+await new Promise(r=>setTimeout(r,500));  // Wait for DB sync
+toast('Account created! Please wait...');
    }else{
       await window.signInWithEmailAndPassword(window.auth,email,pass);
    }
