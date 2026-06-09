@@ -1757,7 +1757,7 @@ function renderProfilePage(){
 }
 
 function confirmLogout(){
-  if(confirm('Sign out of Fiberplane?'))logout();
+  if(confirm('Sign out of Flyover?'))logout();
 }
 
 function openEditProfileSheet(){
@@ -1950,7 +1950,7 @@ function exportCSV(){
   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
   const blob=new Blob([csv],{type:'text/csv'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;a.download='fiberplane_'+currentBook().name+'.csv';a.click();
+  const a=document.createElement('a');a.href=url;a.download='Flyover_'+currentBook().name+'.csv';a.click();
   toast('CSV exported ✓');
 }
 function exportPDF(){
@@ -1980,7 +1980,7 @@ function exportPDF(){
   const balance=totalIncome-totalExpense;
 
   doc.setFontSize(18);
-  doc.text('Fiberplane Expense Report',14,15);
+  doc.text('Flyover Expense Report',14,15);
 
   doc.setFontSize(11);
   doc.text(`Book: ${book.name}`,14,25);
@@ -2023,7 +2023,7 @@ doc.text(
     }
   });
 
-  doc.save(`fiberplane-${book.name}.pdf`);
+  doc.save(`Flyover-${book.name}.pdf`);
 
   toast('PDF exported');
 }
