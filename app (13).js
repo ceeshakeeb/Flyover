@@ -93,28 +93,6 @@ function getUsers(){
 function saveUsers(u){localStorage.setItem('fp_users',JSON.stringify(u));}
 
 function hashPassword(v){ let h=0; for(let i=0;i<v.length;i++){ h=((h<<5)-h)+v.charCodeAt(i); h|=0;} return 'h'+Math.abs(h); }
-function handleAuth(){
-  const email=document.getElementById('fEmail').value.trim().toLowerCase();
-  const pass=document.getElementById('fPassword').value;
-  const name=document.getElementById('fName').value.trim();
-  const err=document.getElementById('authErr');
-  err.style.display='none';
-  if(!email||!pass){err.textContent='Please fill in all fields.';err.style.display='block';return;}
-  const users=getUsers();
-  if(authMode==='register'){
-    if(!name){err.textContent='Please enter your name.';err.style.display='block';return;}
-    if(users.find(u=>u.email===email)){err.textContent='Email already registered.';err.style.display='block';return;}
-    if(pass.length<6){err.textContent='Password must be at least 6 characters.';err.style.display='block';return;}
-    const user={id:uid(),email,name,password:hashPassword(pass),initials:name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()};
-    users.push(user);saveUsers(users);
-    loginUser(user);
-  } else {
-    const user=users.find(u=>u.email===email&&u.password===hashPassword(pass));
-    if(!user){err.textContent='Invalid email or password.';err.style.display='block';return;}
-    loginUser(user);
-  }
-}
-
 function handleGoogleAuth(){
   // Simulate Google OAuth — in prod, integrate Firebase Auth
   const email=prompt('Enter your Gmail address:','');
@@ -266,6 +244,26 @@ function continueAsGuest(){
   renderMonthTabs();showPage('dashboard');
   toast('Guest Mode — View Only');
 }
+function requireLogin(){ if(S.isGuest){ toast('Please login to continue'); return false;} return true; }
+
+function continueAsGuest(){
+  S.isGuest=true;
+  if(!S.books || !S.books.length){
+    const guestBook={id:'guest-book',name:'Demo Book',emoji:'📒',ownerId:'guest',members:[]};
+    S.books=[guestBook];
+    S.currentBookId=guestBook.id;
+    S.categories[guestBook.id]={expense:[...DEFAULT_EXPENSE_CATS],income:[...DEFAULT_INCOME_CATS]};
+    S.transactions=[];
+  }
+  document.getElementById('authScreen').classList.remove('active');
+  document.getElementById('mainScreen').classList.add('active');
+  document.getElementById('userAvatar').textContent='👁';
+  document.getElementById('headerBookName').textContent='Guest Mode';
+  document.getElementById('headerBookIcon').textContent='👀';
+  renderMonthTabs();showPage('dashboard');
+  toast('Guest Mode — View Only');
+}
+
 function requireLogin(){ if(S.isGuest){ toast('Please login to continue'); return false;} return true; }
 
 function logout(){
@@ -1757,7 +1755,7 @@ function renderProfilePage(){
 }
 
 function confirmLogout(){
-  if(confirm('Sign out of Flyover?'))logout();
+  if(confirm('Sign out of Fiberplane?'))logout();
 }
 
 function openEditProfileSheet(){
@@ -1950,7 +1948,7 @@ function exportCSV(){
   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
   const blob=new Blob([csv],{type:'text/csv'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;a.download='Flyover_'+currentBook().name+'.csv';a.click();
+  const a=document.createElement('a');a.href=url;a.download='fiberplane_'+currentBook().name+'.csv';a.click();
   toast('CSV exported ✓');
 }
 function exportPDF(){
@@ -1980,7 +1978,7 @@ function exportPDF(){
   const balance=totalIncome-totalExpense;
 
   doc.setFontSize(18);
-  doc.text('Flyover Expense Report',14,15);
+  doc.text('Fiberplane Expense Report',14,15);
 
   doc.setFontSize(11);
   doc.text(`Book: ${book.name}`,14,25);
@@ -2023,7 +2021,7 @@ doc.text(
     }
   });
 
-  doc.save(`Flyover-${book.name}.pdf`);
+  doc.save(`fiberplane-${book.name}.pdf`);
 
   toast('PDF exported');
 }
@@ -2126,15 +2124,19 @@ async function saveUserData(){
 }
 
 handleAuth = async function(){
- const email=document.getElementById('fEmail').value.trim();
+ const email=document.getElementById('fEmail').value.trim().toLowerCase();
  const pass=document.getElementById('fPassword').value;
  const name=(document.getElementById('fName')?.value||'').trim();
  const err=document.getElementById('authErr');
  if(!email||!pass){err.textContent='Please fill in all fields.';err.style.display='block';return;}
  try{
    if(authMode==='register'){
+      if(!name){err.textContent='Please enter your name.';err.style.display='block';return;}
       const cred=await window.createUserWithEmailAndPassword(window.auth,email,pass);
-      await window.dbSet(window.dbRef(window.db,'users/'+cred.user.uid),{name,email});
+      const userInitials=name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+      await window.dbSet(window.dbRef(window.db,'users/'+cred.user.uid),{name,email,initials:userInitials});
+      await new Promise(r=>setTimeout(r,500));
+      toast('Account created! Please wait...');
    }else{
       await window.signInWithEmailAndPassword(window.auth,email,pass);
    }
@@ -2142,10 +2144,10 @@ handleAuth = async function(){
  }catch(e){
    err.style.display='block';
    const code=e.code||'';
-   if(code==='auth/user-not-found'||code==='auth/invalid-credential')err.textContent='No account found with this email.';
+   if(code==='auth/user-not-found'||code==='auth/invalid-credential')err.textContent='No account found with this email. Please register first.';
    else if(code==='auth/wrong-password')err.textContent='Incorrect password. Please try again.';
    else if(code==='auth/too-many-requests')err.textContent='Too many attempts. Please wait a moment.';
-   else if(code==='auth/email-already-in-use')err.textContent='Email already registered. Please sign in.';
+   else if(code==='auth/email-already-in-use')err.textContent='Email already registered. Please sign in instead.';
    else if(code==='auth/weak-password')err.textContent='Password must be at least 6 characters.';
    else if(code==='auth/network-request-failed')err.textContent='No internet connection. Check your network.';
    else if(code==='auth/invalid-email')err.textContent='Invalid email address.';
@@ -2166,8 +2168,7 @@ window.addEventListener('load',()=>{
  document.body.style.overscrollBehavior='none';
  document.documentElement.style.overscrollBehavior='none';
 });
-// Register Firebase auth listener immediately to avoid race condition
-// where onAuthStateChanged fires before load event
+
 (function registerAuthListener(){
  if(!window.onAuthStateChangedFirebase || !window.auth){
    setTimeout(registerAuthListener,100);
@@ -2180,13 +2181,37 @@ window.addEventListener('load',()=>{
      return;
    }
    if(document.getElementById('mainScreen').classList.contains('active')) return;
+   
    let name=user.displayName||'User';
+   let initials='U';
+   
    try{
      const snap=await window.dbGet(window.dbRef(window.db,'users/'+user.uid));
-     if(snap.exists()){ const p=snap.val(); name=p.name||name; }
+     if(snap.exists()){ 
+       const p=snap.val(); 
+       name=p.name||name;
+       initials=p.initials||(p.name||name).split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+     } else {
+       try{
+         const userInitials=name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
+         await window.dbSet(window.dbRef(window.db,'users/'+user.uid),{
+           name,
+           email:user.email,
+           initials:userInitials
+         });
+         initials=userInitials;
+       }catch(e){console.log('Error creating user node:',e);}
+     }
+     
      const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+user.uid));
      if(ds.exists()) Object.assign(S, ds.val());
-   }catch(e){}
-   loginUser({id:user.uid,name,email:user.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
+   }catch(e){console.log('Error loading user data:',e);}
+   
+   loginUser({
+     id:user.uid,
+     name,
+     email:user.email,
+     initials:initials
+   });
  });
 })();
