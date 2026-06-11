@@ -145,12 +145,17 @@ function loginUser(user){
       });
     }catch(e){}
   }
-  // Merge any data for this user
-  const key='fp_data_'+user.id;
-  try{
-    const raw=localStorage.getItem(key);
-    if(raw){const d=JSON.parse(raw);Object.assign(S,d);}
-  }catch{}
+  // Load local cache — Firebase data (loaded by the caller before loginUser) takes priority,
+  // so only use the local cache if S has no books yet (i.e. Firebase didn't load anything).
+  if(!S.books || !S.books.length){
+    const cacheKeys=['fp_cache_'+user.id, 'fp_data_'+user.id];
+    for(const key of cacheKeys){
+      try{
+        const raw=localStorage.getItem(key);
+        if(raw){const d=JSON.parse(raw); Object.assign(S,d); break;}
+      }catch{}
+    }
+  }
   S.user={id:user.id,name:user.name,email:user.email,initials:user.initials||'U'};
   // Ensure default book exists
   if(!S.books||!S.books.length){
@@ -198,12 +203,15 @@ async function loadSharedBooksThenRender(){
     }
   }catch(e){console.log('Error loading invited books:',e);}
   
-  // Load all shared books this user is a member of
-  const sharedBooks=S.books.filter(b=>isSharedBook(b.id));
-  for(const b of sharedBooks){
+  // FIX: Check ALL books against sharedBooks/ — not just ones already flagged shared.
+  // This handles the case where another user joined on a different device and the
+  // owner's local S.books never got the shared=true flag updated.
+  for(const b of S.books){
     try{
       const snap=await window.dbGet(window.dbRef(window.db,'sharedBooks/'+b.id));
       if(snap.exists()){
+        // Promote to shared so isSharedBook() returns true from now on
+        b.shared=true;
         const data=snap.val();
         if(data.transactions){
           S.transactions=S.transactions.filter(t=>t.bookId!==b.id);
@@ -302,11 +310,8 @@ function guestBlocked(){
 
   return false;
 }
-function saveUserData(){
-  if(!S.user)return;
-  const key='fp_data_'+S.user.id;
-  localStorage.setItem(key,JSON.stringify({books:S.books,currentBookId:S.currentBookId,transactions:S.transactions,categories:S.categories,currentMonth:S.currentMonth}));
-}
+// saveUserData is defined near the bottom of this file (Firebase version).
+// Do NOT add a second definition here — it would shadow the Firebase one.
 
 // ═══════════════════════════════════════════════
 //  BOOKS
@@ -331,7 +336,22 @@ function attachSharedBookListener(bookId){
   if(!window.db || !window.dbOnValue) return;
   // Detach previous listener
   detachSharedBookListener();
-  if(!isSharedBook(bookId)) return;
+  // FIX: If book is not locally flagged as shared, probe Firebase first.
+  // Another user may have joined from a different device without this device knowing.
+  if(!isSharedBook(bookId)){
+    window.dbGet(window.dbRef(window.db,'sharedBooks/'+bookId)).then(snap=>{
+      if(snap.exists()){
+        const b=S.books.find(bk=>bk.id===bookId);
+        if(b){ b.shared=true; }
+        _doAttachSharedBookListener(bookId);
+      }
+    }).catch(()=>{});
+    return;
+  }
+  _doAttachSharedBookListener(bookId);
+}
+
+function _doAttachSharedBookListener(bookId){
   _listenedBookId=bookId;
   const path=window.dbRef(window.db,'sharedBooks/'+bookId);
   _sharedBookListener=window.dbOnValue(path, snap=>{
@@ -905,54 +925,73 @@ function copyBookId(id){
 }
 
 async function inviteByEmail(){
-  const email=document.getElementById('inviteEmail').value.trim().toLowerCase();
-  if(!email)return;
-  
-  // Search localStorage users first
-  let invitedUser=getUsers().find(u=>u.email.toLowerCase()===email)||null;
-  
-  // Search Firebase users node if not found locally
+  const rawEmail=document.getElementById('inviteEmail').value.trim();
+  const email=rawEmail.toLowerCase();
+  if(!email){toast('Enter an email address');return;}
+
+  // Show loading state
+  const inviteBtn=document.querySelector('#sheetInner .btn-sq');
+  if(inviteBtn){inviteBtn.textContent='...';inviteBtn.disabled=true;}
+
+  let invitedUser=null;
+
+  // ── Step 1: Check email index (fast, O(1) lookup, no security rule issues)
+  // We write to emailIndex/{sanitized_email} → {uid, name} on every login/register.
+  if(!invitedUser && window.db){
+    try{
+      const safeEmail=email.replace(/[.#$\[\]]/g,',');
+      const snap=await window.dbGet(window.dbRef(window.db,'emailIndex/'+safeEmail));
+      if(snap.exists()){
+        const d=snap.val();
+        invitedUser={id:d.uid,email:rawEmail,name:d.name||rawEmail.split('@')[0],initials:(d.name||rawEmail).slice(0,2).toUpperCase()};
+      }
+    }catch(e){console.log('emailIndex lookup:',e);}
+  }
+
+  // ── Step 2: Direct lookup if we know the UID (via users/{uid} with orderByChild)
+  // Firebase rules usually allow reading your own data, but not all users.
+  // Try scanning users/ — works if rules allow; fails silently if not.
   if(!invitedUser && window.db){
     try{
       const snap=await window.dbGet(window.dbRef(window.db,'users'));
       if(snap.exists()){
         for(const [uid,udata] of Object.entries(snap.val())){
-          const userEmail=(udata.email||'').toLowerCase().trim();
-          if(userEmail===email){
-            invitedUser={id:uid,email:udata.email,name:udata.name||email.split('@')[0],initials:(udata.name||email).slice(0,2).toUpperCase()};
+          if((udata.email||'').toLowerCase().trim()===email){
+            invitedUser={id:uid,email:udata.email||rawEmail,name:udata.name||rawEmail.split('@')[0],initials:(udata.name||rawEmail).slice(0,2).toUpperCase()};
             break;
           }
         }
       }
-    }catch(e){console.log('Firebase users node search:',e);}
+    }catch(e){console.log('users node scan:',e);}
   }
-  
-  // BUG FIX #2: Fallback - scan expenseData for user (catches users who created books but aren't in users node yet)
+
+  // ── Step 3: Scan expenseData — catches users registered before emailIndex existed
   if(!invitedUser && window.db){
     try{
       const expSnap=await window.dbGet(window.dbRef(window.db,'expenseData'));
       if(expSnap.exists()){
-        const allUserData=expSnap.val();
-        for(const [uid,udata] of Object.entries(allUserData)){
-          if(!udata || !udata.books) continue;
-          // Check this user's profile or extract from their books' members
-          for(const book of udata.books){
-            if(!book.members) continue;
-            for(const member of book.members){
-              if((member.email||'').toLowerCase().trim()===email){
-                invitedUser={id:uid,email:member.email,name:member.name,initials:(member.name||email).slice(0,2).toUpperCase()};
-                break;
-              }
+        for(const [uid,udata] of Object.entries(expSnap.val())){
+          // Check owner email from their book members (owner always added as member)
+          if(!udata||!udata.books) continue;
+          for(const book of (udata.books||[])){
+            const ownerMember=(book.members||[]).find(m=>m.role==='owner'&&m.userId===uid);
+            if(ownerMember&&(ownerMember.email||'').toLowerCase().trim()===email){
+              invitedUser={id:uid,email:ownerMember.email,name:ownerMember.name||rawEmail.split('@')[0],initials:(ownerMember.name||rawEmail).slice(0,2).toUpperCase()};
+              break;
             }
-            if(invitedUser) break;
           }
           if(invitedUser) break;
         }
       }
-    }catch(e){console.log('Firebase expenseData fallback search:',e);}
+    }catch(e){console.log('expenseData scan:',e);}
   }
-  
-  if(!invitedUser){toast('User not found. They must register first.');return;}
+
+  if(inviteBtn){inviteBtn.textContent='+';inviteBtn.disabled=false;}
+
+  if(!invitedUser){
+    toast('User not found. Ask them to sign in to Fiberplane at least once first.');
+    return;
+  }
   const book=currentBook();
   if(book.members.find(m=>m.userId===invitedUser.id)){toast('Already a member!');return;}
   book.shared=true;  // mark as shared book
@@ -1914,6 +1953,20 @@ function saveTxn(id){
     saveSharedBookData(S.currentBookId);
   } else {
     saveUserData();
+    // FIX: Also check Firebase — another device may have joined this book,
+    // making it shared without this device knowing. If sharedBooks/{id} exists,
+    // promote locally and sync there too so the joiner sees the data.
+    if(window.db && S.currentBookId){
+      window.dbGet(window.dbRef(window.db,'sharedBooks/'+S.currentBookId)).then(snap=>{
+        if(snap.exists()){
+          const b=S.books.find(bk=>bk.id===S.currentBookId);
+          if(b && !b.shared){
+            b.shared=true;
+            saveSharedBookData(S.currentBookId);
+          }
+        }
+      }).catch(()=>{});
+    }
   }
   closeSheetNow();
   toast(id?'Entry updated ✓':'Entry saved ✓');
@@ -1935,6 +1988,15 @@ function deleteTxn(id){
     saveSharedBookData(S.currentBookId);
   } else {
     saveUserData();
+    // FIX: promote to shared if another user joined on a different device
+    if(window.db && S.currentBookId){
+      window.dbGet(window.dbRef(window.db,'sharedBooks/'+S.currentBookId)).then(snap=>{
+        if(snap.exists()){
+          const b=S.books.find(bk=>bk.id===S.currentBookId);
+          if(b && !b.shared){ b.shared=true; saveSharedBookData(S.currentBookId); }
+        }
+      }).catch(()=>{});
+    }
   }
   closeSheetNow();
 
@@ -2091,38 +2153,61 @@ function showSyncIndicator(state){
 // ═══════════════════════════════════════════════
 //  BOOT
 // ═══════════════════════════════════════════════
+// NOTE: We do NOT call loginUser() here from localStorage anymore.
+// The Firebase onAuthStateChanged listener (at the bottom) handles session restore.
+// This avoids loading stale local data before Firebase has a chance to return fresh data.
+// load() is still called to populate S with any cached state for offline fallback.
 load();
-if(S.user){
-  // Resume session
-  const users=getUsers();
-  const u=users.find(u=>u.id===S.user.id);
-  if(u)loginUser(u);
-}
 
 
 
 // ===== FIREBASE OVERRIDES =====
 async function saveUserData(){
- if(!S.user || !window.db) return;
- // Cache everything locally
- localStorage.setItem('fp_cache_'+S.user.id,JSON.stringify({
-   books:S.books,currentBookId:S.currentBookId,
-   transactions:S.transactions,categories:S.categories,currentMonth:S.currentMonth
- }));
- // Personal data (non-shared txns + book list) → expenseData/{uid}
- const personalTxns=S.transactions.filter(t=>{
-   const b=S.books.find(bk=>bk.id===t.bookId);
-   return !b || !isSharedBook(t.bookId);
- });
- const data={books:S.books,currentBookId:S.currentBookId,transactions:personalTxns,categories:S.categories,currentMonth:S.currentMonth};
- try{ await window.dbSet(window.dbRef(window.db,'expenseData/'+S.user.id),data);}catch(e){console.log(e);}
- // Shared books → sharedBooks/{bookId}
+ if(!S.user) return;
+
+ // Always write local cache so offline / pre-Firebase-init works
+ const snapshot={
+   books:S.books, currentBookId:S.currentBookId,
+   transactions:S.transactions, categories:S.categories, currentMonth:S.currentMonth
+ };
+ localStorage.setItem('fp_cache_'+S.user.id, JSON.stringify(snapshot));
+
+ if(!window.db) return; // Firebase not ready yet — local cache is enough for now
+
+ showSyncIndicator('syncing');
+ try{
+   // Save ALL data (personal + shared) to expenseData/{uid} — Firebase is source of truth
+   const data={
+     books:S.books, currentBookId:S.currentBookId,
+     transactions:S.transactions,
+     categories:S.categories, currentMonth:S.currentMonth
+   };
+   await window.dbSet(window.dbRef(window.db,'expenseData/'+S.user.id), data);
+   showSyncIndicator('synced');
+ }catch(e){
+   console.log('saveUserData Firebase error:', e);
+   showSyncIndicator('error');
+ }
+
+ // Also push shared books to sharedBooks/{bookId} for real-time collaboration
  const sharedBookIds=[...new Set(
    S.books.filter(b=>isSharedBook(b.id)).map(b=>b.id)
  )];
  for(const bid of sharedBookIds){
    await saveSharedBookData(bid);
  }
+}
+
+
+// ── EMAIL INDEX HELPER ──────────────────────────────────────────────────────
+// Writes emailIndex/{safe_email} → {uid, name} so inviteByEmail can find
+// any user by email without scanning all records (works even if users/ is locked).
+function writeEmailIndex(uid, email, name){
+  if(!window.db || !uid || !email) return;
+  try{
+    const safeEmail=email.toLowerCase().replace(/[.#$\[\]]/g,',');
+    window.dbSet(window.dbRef(window.db,'emailIndex/'+safeEmail),{uid,name:name||''}).catch(e=>{});
+  }catch(e){}
 }
 
 // Override handleAuth + handleGoogleAuth once Firebase is ready
@@ -2146,6 +2231,7 @@ async function saveUserData(){
         fbUser=cred.user;
         const saveName=name||email.split('@')[0];
         await window.dbSet(window.dbRef(window.db,'users/'+fbUser.uid),{name:saveName,email});
+        writeEmailIndex(fbUser.uid,email,saveName);
         loginUser({id:fbUser.uid,name:saveName,email:fbUser.email,initials:saveName.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
       }else{
         const cred=await window.signInWithEmailAndPassword(window.auth,email,pass);
@@ -2157,6 +2243,7 @@ async function saveUserData(){
           const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+fbUser.uid));
           if(ds.exists()) Object.assign(S, ds.val());
         }catch(e){}
+        writeEmailIndex(fbUser.uid,fbUser.email,name);
         loginUser({id:fbUser.uid,name,email:fbUser.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
       }
     }catch(e){
@@ -2179,6 +2266,7 @@ async function saveUserData(){
       const u=result.user;
       const name=u.displayName||'User';
       await window.dbSet(window.dbRef(window.db,'users/'+u.uid),{name,email:u.email});
+      writeEmailIndex(u.uid,u.email,name);
       loginUser({id:u.uid,name,email:u.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
     }catch(e){
       const code=e.code||'';
@@ -2211,6 +2299,7 @@ window.addEventListener('load',()=>{
      const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+user.uid));
      if(ds.exists()) Object.assign(S, ds.val());
    }catch(e){}
+   writeEmailIndex(user.uid,user.email,name);
    loginUser({id:user.uid,name,email:user.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
  });
 })();
