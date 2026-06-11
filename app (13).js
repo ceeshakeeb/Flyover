@@ -76,6 +76,8 @@ function load(){
 //  In a real app, swap this for Firebase/Supabase
 // ═══════════════════════════════════════════════
 let authMode='login';
+// Track whether user explicitly signed out (prevents ghost re-login)
+let _userExplicitlySignedOut = localStorage.getItem('fp_signed_out') === '1';
 function switchAuthTab(m){
   authMode=m;
   document.getElementById('tabLogin').classList.toggle('active',m==='login');
@@ -91,6 +93,28 @@ function getUsers(){
 function saveUsers(u){localStorage.setItem('fp_users',JSON.stringify(u));}
 
 function hashPassword(v){ let h=0; for(let i=0;i<v.length;i++){ h=((h<<5)-h)+v.charCodeAt(i); h|=0;} return 'h'+Math.abs(h); }
+function handleAuth(){
+  const email=document.getElementById('fEmail').value.trim().toLowerCase();
+  const pass=document.getElementById('fPassword').value;
+  const name=document.getElementById('fName').value.trim();
+  const err=document.getElementById('authErr');
+  err.style.display='none';
+  if(!email||!pass){err.textContent='Please fill in all fields.';err.style.display='block';return;}
+  const users=getUsers();
+  if(authMode==='register'){
+    if(!name){err.textContent='Please enter your name.';err.style.display='block';return;}
+    if(users.find(u=>u.email===email)){err.textContent='Email already registered.';err.style.display='block';return;}
+    if(pass.length<6){err.textContent='Password must be at least 6 characters.';err.style.display='block';return;}
+    const user={id:uid(),email,name,password:hashPassword(pass),initials:name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()};
+    users.push(user);saveUsers(users);
+    loginUser(user);
+  } else {
+    const user=users.find(u=>u.email===email&&u.password===hashPassword(pass));
+    if(!user){err.textContent='Invalid email or password.';err.style.display='block';return;}
+    loginUser(user);
+  }
+}
+
 function handleGoogleAuth(){
   // Simulate Google OAuth — in prod, integrate Firebase Auth
   const email=prompt('Enter your Gmail address:','');
@@ -539,19 +563,13 @@ function openBookSettingsSheet(bookId){
 }
 
 function deleteUserFromBook(bookId,userEmail){
-  // Ask for email confirmation to prevent accidental deletion
-  const confirmEmail=prompt(`To confirm deletion of ${userEmail}, please type their email address:`,'');
-  if(!confirmEmail || confirmEmail.toLowerCase().trim() !== userEmail.toLowerCase().trim()){
-    toast('Deletion cancelled - email did not match');
-    return;
-  }
-  
+  if(!confirm(`Delete ${userEmail} from this book? They will no longer see it.`))return;
   const b=S.books.find(bk=>bk.id===bookId);
   if(!b)return;
-  b.members=b.members.filter(m=>m.email.toLowerCase()!==userEmail.toLowerCase());
+  b.members=b.members.filter(m=>m.email!==userEmail);
   saveUserData();
   if(isSharedBook(b.id)) saveSharedBookData(b.id);
-  toast('✓ Member removed');
+  toast('Member removed ✓');
   openBookSettingsSheet(bookId);
 }
 
@@ -727,7 +745,7 @@ async function joinBook(){
   const joinBtn=document.querySelector('#sheetInner .btn-primary');
   if(joinBtn){joinBtn.textContent='Searching...';joinBtn.disabled=true;}
   
-  let found=null;let foundOwnerId=null;
+  let found=null;let foundOwnerId=null;let foundOwnerKey=null;
   
   // Search Firebase expenseData index node (fast lookup)
   if(window.db){
@@ -768,7 +786,7 @@ async function joinBook(){
         for(const k of cacheKeys){
           const d=JSON.parse(localStorage.getItem(k)||'{}');
           const b=(d.books||[]).find(b=>b.id===id);
-          if(b){found=b;foundOwnerId=u.id;break;}
+          if(b){found=b;foundOwnerId=u.id;foundOwnerKey=k;break;}
         }
         if(found)break;
       }catch{}
@@ -783,15 +801,12 @@ async function joinBook(){
   found.members.push({userId:S.user.id,email:S.user.email,name:S.user.name,role:'member'});
   
   // Update owner's data (both localStorage and Firebase)
-  if(foundOwnerId){
+  if(foundOwnerKey){
     try{
-      const foundOwnerKey='fp_data_'+foundOwnerId;
       const d=JSON.parse(localStorage.getItem(foundOwnerKey)||'{}');
-      if(d.books){
-        const bi=d.books.findIndex(b=>b.id===id);
-        if(bi>=0)d.books[bi]=found;
-        localStorage.setItem(foundOwnerKey,JSON.stringify(d));
-      }
+      const bi=d.books.findIndex(b=>b.id===id);
+      if(bi>=0)d.books[bi]=found;
+      localStorage.setItem(foundOwnerKey,JSON.stringify(d));
     }catch{}
   }
   
@@ -893,63 +908,26 @@ async function inviteByEmail(){
   const email=document.getElementById('inviteEmail').value.trim().toLowerCase();
   if(!email)return;
   
-  // Search 1: localStorage registered users
+  // Search localStorage users first
   let invitedUser=getUsers().find(u=>u.email.toLowerCase()===email)||null;
   
-  // Search 2: All localStorage user data (catches members in other books)
-  if(!invitedUser){
-    try{
-      const allUsers=getUsers();
-      for(const u of allUsers){
-        const key='fp_data_'+u.id;
-        const d=JSON.parse(localStorage.getItem(key)||'{}');
-        if(d.books){
-          for(const book of d.books){
-            if(book.members){
-              for(const member of book.members){
-                if((member.email||'').toLowerCase().trim()===email){
-                  invitedUser={
-                    id:member.userId||u.id,
-                    email:member.email||email,
-                    name:member.name||email.split('@')[0],
-                    initials:(member.initials||member.name||email).slice(0,2).toUpperCase()
-                  };
-                  break;
-                }
-              }
-              if(invitedUser) break;
-            }
-          }
-          if(invitedUser) break;
-        }
-      }
-    }catch(e){console.log('localStorage search error:',e);}
-  }
-  
-  // Search 3: Firebase users node
+  // Search Firebase users node if not found locally
   if(!invitedUser && window.db){
     try{
       const snap=await window.dbGet(window.dbRef(window.db,'users'));
       if(snap.exists()){
-        const allUsers=snap.val();
-        for(const [uid,udata] of Object.entries(allUsers)){
-          if(!udata) continue;
+        for(const [uid,udata] of Object.entries(snap.val())){
           const userEmail=(udata.email||'').toLowerCase().trim();
           if(userEmail===email){
-            invitedUser={
-              id:uid,
-              email:udata.email||email,
-              name:udata.name||email.split('@')[0],
-              initials:(udata.initials||udata.name||email).slice(0,2).toUpperCase()
-            };
+            invitedUser={id:uid,email:udata.email,name:udata.name||email.split('@')[0],initials:(udata.name||email).slice(0,2).toUpperCase()};
             break;
           }
         }
       }
-    }catch(e){console.log('Firebase users node search error:',e);}
+    }catch(e){console.log('Firebase users node search:',e);}
   }
   
-  // Search 4: Fallback - scan expenseData (catches users who created books)
+  // BUG FIX #2: Fallback - scan expenseData for user (catches users who created books but aren't in users node yet)
   if(!invitedUser && window.db){
     try{
       const expSnap=await window.dbGet(window.dbRef(window.db,'expenseData'));
@@ -957,17 +935,12 @@ async function inviteByEmail(){
         const allUserData=expSnap.val();
         for(const [uid,udata] of Object.entries(allUserData)){
           if(!udata || !udata.books) continue;
-          // Check this user's books for members with matching email
+          // Check this user's profile or extract from their books' members
           for(const book of udata.books){
             if(!book.members) continue;
             for(const member of book.members){
               if((member.email||'').toLowerCase().trim()===email){
-                invitedUser={
-                  id:uid,
-                  email:member.email||email,
-                  name:member.name||email.split('@')[0],
-                  initials:(member.initials||member.name||email).slice(0,2).toUpperCase()
-                };
+                invitedUser={id:uid,email:member.email,name:member.name,initials:(member.name||email).slice(0,2).toUpperCase()};
                 break;
               }
             }
@@ -976,14 +949,10 @@ async function inviteByEmail(){
           if(invitedUser) break;
         }
       }
-    }catch(e){console.log('Firebase expenseData fallback search error:',e);}
+    }catch(e){console.log('Firebase expenseData fallback search:',e);}
   }
   
-  if(!invitedUser){
-    toast('User not found. Ask them to create account or join via Book ID.');
-    return;
-  }
-  
+  if(!invitedUser){toast('User not found. They must register first.');return;}
   const book=currentBook();
   if(book.members.find(m=>m.userId===invitedUser.id)){toast('Already a member!');return;}
   book.shared=true;  // mark as shared book
@@ -1102,7 +1071,7 @@ function renderMonthTabs(){
 
   const months=getBookMonths(S.currentBookId,_selYear);
   
-  // Build dropdown options: "Jan 2026", "Feb 2026", etc. (NO "All Year")
+  // Build dropdown options: "Jan 2026", "Feb 2026", etc. + "All Year"
   const allMonths=[];
   for(const y of years){
     const yMonths=getBookMonths(S.currentBookId,y);
@@ -1111,15 +1080,22 @@ function renderMonthTabs(){
       allMonths.push({key:m,label});
     }
   }
+  // Add "All Year" option for each year
+  for(const y of years){
+    allMonths.push({key:'all-'+y,label:`All ${y}`});
+  }
   
   // Current selection display value
-  let displayValue=monthLabel(S.currentMonth);
-  if(S.currentMonth==='all' && _selYear){
-    displayValue=monthLabel(getBookMonths(S.currentBookId,_selYear)[0]||today().slice(0,7));
+  let displayValue='All Year';
+  if(S.currentMonth!=='all'){
+    const ml=monthLabel(S.currentMonth);
+    displayValue=ml;
+  }else if(_selYear){
+    displayValue=`All ${_selYear}`;
   }
   
   const optionsHtml=allMonths.map(opt=>{
-    const isSelected=(opt.key===S.currentMonth);
+    const isSelected=(opt.key===S.currentMonth)||(S.currentMonth==='all'&&opt.key===`all-${_selYear}`);
     return `<option value="${opt.key}" ${isSelected?'selected':''}>${opt.label}</option>`;
   }).join('');
   
@@ -1134,8 +1110,13 @@ function renderMonthTabs(){
 }
 
 function selectMonthFromDropdown(val){
-  S.currentMonth=val;
-  _selYear=val.slice(0,4);
+  if(val.startsWith('all-')){
+    _selYear=val.slice(4);
+    S.currentMonth='all';
+  }else{
+    S.currentMonth=val;
+    _selYear=val.slice(0,4);
+  }
   renderMonthTabs();renderPage();
 }
 
@@ -2144,101 +2125,92 @@ async function saveUserData(){
  }
 }
 
-handleAuth = async function(){
- const email=document.getElementById('fEmail').value.trim().toLowerCase();
- const pass=document.getElementById('fPassword').value;
- const name=(document.getElementById('fName')?.value||'').trim();
- const err=document.getElementById('authErr');
- if(!email||!pass){err.textContent='Please fill in all fields.';err.style.display='block';return;}
- try{
-   if(authMode==='register'){
-      if(!name){err.textContent='Please enter your name.';err.style.display='block';return;}
-      const cred=await window.createUserWithEmailAndPassword(window.auth,email,pass);
-      // FIX: Wait for user data to be saved + retry if needed
-      const userInitials=name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
-      await window.dbSet(window.dbRef(window.db,'users/'+cred.user.uid),{name,email,initials:userInitials});
-      // Wait brief moment for DB to sync
-      await new Promise(r=>setTimeout(r,500));
-      toast('Account created! Please wait...');
-   }else{
-      await window.signInWithEmailAndPassword(window.auth,email,pass);
-   }
-   err.style.display='none';
- }catch(e){
-   err.style.display='block';
-   const code=e.code||'';
-   if(code==='auth/user-not-found'||code==='auth/invalid-credential')err.textContent='No account found with this email. Please register first.';
-   else if(code==='auth/wrong-password')err.textContent='Incorrect password. Please try again.';
-   else if(code==='auth/too-many-requests')err.textContent='Too many attempts. Please wait a moment.';
-   else if(code==='auth/email-already-in-use')err.textContent='Email already registered. Please sign in instead.';
-   else if(code==='auth/weak-password')err.textContent='Password must be at least 6 characters.';
-   else if(code==='auth/network-request-failed')err.textContent='No internet connection. Check your network.';
-   else if(code==='auth/invalid-email')err.textContent='Invalid email address.';
-   else err.textContent=e.message||'Login failed. Please try again.';
- }
-}
+// Override handleAuth + handleGoogleAuth once Firebase is ready
+(function waitForFirebase(){
+  if(!window.auth || !window.signInWithEmailAndPassword || !window.createUserWithEmailAndPassword){
+    setTimeout(waitForFirebase, 100);
+    return;
+  }
 
-handleGoogleAuth = async function(){
- try{
-   const result=await window.signInWithPopup(window.auth, new window.GoogleAuthProvider());
-   const u=result.user;
-   await window.dbSet(window.dbRef(window.db,'users/'+u.uid),{name:u.displayName,email:u.email});
-   loginUser({id:u.uid,name:u.displayName||'User',email:u.email,initials:(u.displayName||'U').split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
-   toast('Login successful');
- }catch(e){toast(e.message);}
-}
+  handleAuth = async function(){
+    const email=document.getElementById('fEmail').value.trim();
+    const pass=document.getElementById('fPassword').value;
+    const name=(document.getElementById('fName')?.value||'').trim();
+    const err=document.getElementById('authErr');
+    err.style.display='none';
+    if(!email||!pass){err.textContent='Please fill in all fields.';err.style.display='block';return;}
+    try{
+      let fbUser;
+      if(authMode==='register'){
+        const cred=await window.createUserWithEmailAndPassword(window.auth,email,pass);
+        fbUser=cred.user;
+        const saveName=name||email.split('@')[0];
+        await window.dbSet(window.dbRef(window.db,'users/'+fbUser.uid),{name:saveName,email});
+        loginUser({id:fbUser.uid,name:saveName,email:fbUser.email,initials:saveName.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
+      }else{
+        const cred=await window.signInWithEmailAndPassword(window.auth,email,pass);
+        fbUser=cred.user;
+        let name=fbUser.displayName||'User';
+        try{
+          const snap=await window.dbGet(window.dbRef(window.db,'users/'+fbUser.uid));
+          if(snap.exists()){const p=snap.val();name=p.name||name;}
+          const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+fbUser.uid));
+          if(ds.exists()) Object.assign(S, ds.val());
+        }catch(e){}
+        loginUser({id:fbUser.uid,name,email:fbUser.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
+      }
+    }catch(e){
+      err.style.display='block';
+      const code=e.code||'';
+      if(code==='auth/user-not-found'||code==='auth/invalid-credential')err.textContent='No account found with this email.';
+      else if(code==='auth/wrong-password')err.textContent='Incorrect password. Please try again.';
+      else if(code==='auth/too-many-requests')err.textContent='Too many attempts. Please wait a moment.';
+      else if(code==='auth/email-already-in-use')err.textContent='Email already registered. Please sign in.';
+      else if(code==='auth/weak-password')err.textContent='Password must be at least 6 characters.';
+      else if(code==='auth/network-request-failed')err.textContent='No internet connection. Check your network.';
+      else if(code==='auth/invalid-email')err.textContent='Invalid email address.';
+      else err.textContent=e.message||'Login failed. Please try again.';
+    }
+  };
 
-// Track whether user explicitly signed out (prevents ghost re-login)
-let _userExplicitlySignedOut = localStorage.getItem('fp_signed_out') === '1';
-
+  handleGoogleAuth = async function(){
+    try{
+      const result=await window.signInWithPopup(window.auth, new window.GoogleAuthProvider());
+      const u=result.user;
+      const name=u.displayName||'User';
+      await window.dbSet(window.dbRef(window.db,'users/'+u.uid),{name,email:u.email});
+      loginUser({id:u.uid,name,email:u.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
+    }catch(e){
+      const code=e.code||'';
+      if(code!=='auth/popup-closed-by-user') toast(e.message||'Google sign-in failed.');
+    }
+  };
+})();
 window.addEventListener('load',()=>{
- // Prevent pull-to-refresh on mobile from reloading page
  document.body.style.overscrollBehavior='none';
  document.documentElement.style.overscrollBehavior='none';
- if(!window.onAuthStateChangedFirebase) return;
+});
+// Register Firebase auth listener immediately to avoid race condition
+// where onAuthStateChanged fires before load event
+(function registerAuthListener(){
+ if(!window.onAuthStateChangedFirebase || !window.auth){
+   setTimeout(registerAuthListener,100);
+   return;
+ }
  window.onAuthStateChangedFirebase(window.auth, async(user)=>{
    if(!user) return;
-   // If user explicitly signed out, sign them out of Firebase too and stop
    if(_userExplicitlySignedOut){
      try{await window.signOutFirebase(window.auth);}catch(e){}
      return;
    }
-   // Don't auto-login if already showing main screen (prevents back-nav ghost login)
    if(document.getElementById('mainScreen').classList.contains('active')) return;
-   
    let name=user.displayName||'User';
-   let initials='U';
-   
    try{
-     // FIX: Fetch user data from users node with retry logic
      const snap=await window.dbGet(window.dbRef(window.db,'users/'+user.uid));
-     if(snap.exists()){ 
-       const p=snap.val(); 
-       name=p.name||name;
-       initials=p.initials||(p.name||name).split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
-     } else {
-       // FIX: User not in users node yet - create entry
-       try{
-         const userInitials=name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase();
-         await window.dbSet(window.dbRef(window.db,'users/'+user.uid),{
-           name,
-           email:user.email,
-           initials:userInitials
-         });
-         initials=userInitials;
-       }catch(e){console.log('Error creating user node:',e);}
-     }
-     
-     // FIX: Load user's expense data
+     if(snap.exists()){ const p=snap.val(); name=p.name||name; }
      const ds=await window.dbGet(window.dbRef(window.db,'expenseData/'+user.uid));
      if(ds.exists()) Object.assign(S, ds.val());
-   }catch(e){console.log('Error loading user data:',e);}
-   
-   loginUser({
-     id:user.uid,
-     name,
-     email:user.email,
-     initials:initials
-   });
+   }catch(e){}
+   loginUser({id:user.uid,name,email:user.email,initials:name.split(' ').map(x=>x[0]).join('').slice(0,2).toUpperCase()});
  });
-});
+})();
